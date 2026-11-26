@@ -17,6 +17,7 @@ def test_complete_and_degraded_demos_render_dashboard():
     app.checkbox[0].set_value(True).run(timeout=30)
     assert not app.exception
     assert len(app.tabs) == 3
+    assert len(app.expander) == 4
     assert "Synthetic demo" in app.markdown[3].value
     app.radio[0].set_value("Demo with missing data").run(timeout=30)
     assert not app.exception

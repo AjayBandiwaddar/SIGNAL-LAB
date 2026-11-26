@@ -2,15 +2,15 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from io import StringIO
+from html import escape
 
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
 from signal_lab.comparison import compare_windows, rhythm_status
 from signal_lab.demo_data import complete_comparison_example, degraded_recent_example
+from signal_lab.evidence import build_evidence_report, canonical_input_bytes, html_report, report_json
 from signal_lab.ingestion import InputValidationError, load_csv, validate_records
 from signal_lab.metrics import calculate_daily_metrics
 from signal_lab.normalization import build_timeline
@@ -59,27 +59,33 @@ def _reset() -> None:
 def _input_data(choice: str, uploaded, timezone: str) -> tuple[pd.DataFrame | None, str, str | None]:
     """Obtain data solely in this Streamlit session; uploads are never written to disk."""
     if choice == "Complete synthetic demo":
-        return complete_comparison_example(timezone=timezone), "Synthetic demo — complete", None
+        return complete_comparison_example(timezone=timezone), "Synthetic demo - complete", None
     if choice == "Demo with missing data":
-        return degraded_recent_example(timezone=timezone), "Synthetic demo — missing data", None
+        return degraded_recent_example(timezone=timezone), "Synthetic demo - missing data", None
     if uploaded is None:
         return None, "Your CSV", "Choose a CSV to begin your report."
     try:
         raw = uploaded.getvalue()
         # Retain only this session's bytes; no disk writes and no shared cache.
         st.session_state.uploaded_bytes = raw
-        return load_csv(raw.decode("utf-8"), timezone=timezone), uploaded.name, None
+        data = load_csv(raw.decode("utf-8"), timezone=timezone)
+        data.attrs["raw_input"] = raw
+        return data, uploaded.name, None
     except (UnicodeDecodeError, InputValidationError) as exc:
         return None, "Your CSV", f"We could not use that file: {exc}"
 
 
-def _analyse(data: pd.DataFrame, timezone: str) -> dict:
+def _analyse(data: pd.DataFrame, timezone: str, *, is_synthetic: bool = False) -> dict:
+    raw_input = data.attrs.get("raw_input", canonical_input_bytes(data))
     records = validate_records(data, timezone=timezone)
     timeline = build_timeline(records, timezone=timezone)
     quality = assess_daily_quality(timeline, timezone=timezone)
     daily, bouts = calculate_daily_metrics(timeline)
+    comparison = compare_windows(daily, quality)
+    report = build_evidence_report(records=records, daily=daily, quality=quality, comparison=comparison,
+                                   raw_input=raw_input, timezone=timezone, is_synthetic=is_synthetic)
     return {"records": records, "timeline": timeline, "quality": quality, "daily": daily,
-            "bouts": bouts, "comparison": compare_windows(daily, quality)}
+            "bouts": bouts, "comparison": comparison, "report": report}
 
 
 def _meta(analysis: dict, label: str) -> None:
@@ -87,20 +93,30 @@ def _meta(analysis: dict, label: str) -> None:
     dates = f"{records.timestamp.min().date():%d %b %Y} – {records.timestamp.max().date():%d %b %Y}"
     source = records.get("source", pd.Series(dtype=str)).dropna().iloc[0] if "source" in records and records.source.notna().any() else "Not supplied"
     device = records.get("device", pd.Series(dtype=str)).dropna().iloc[0] if "device" in records and records.device.notna().any() else "Not supplied"
-    st.markdown(f'<div class="surface"><b>{label}</b> &nbsp;·&nbsp; {dates} &nbsp;·&nbsp; Source: {source} &nbsp;·&nbsp; Device: {device}<br><span style="color:{MUTED}">{int(quality.qualifies.sum())} qualifying days of {len(quality)} represented; 95% usable-minute prototype threshold.</span></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="surface"><b>{escape(label)}</b> &nbsp;|&nbsp; {dates} &nbsp;|&nbsp; Source: {escape(str(source))} &nbsp;|&nbsp; Device: {escape(str(device))}<br><span style="color:{MUTED}">{int(quality.qualifies.sum())} qualifying days of {len(quality)} represented; 95% usable-minute prototype threshold.</span></div>', unsafe_allow_html=True)
 
 
 def _metric_card(key: str, data: dict) -> None:
-    metric = data["comparison"].get("metrics", {}).get(key)
+    metric = data["report"]["calculated_results"][key]
+    evidence = data["report"]["evidence_metadata"][key]
+    explanation = data["report"]["explanations"][key]
     with st.container(border=False):
-        if not metric or metric["status"] == "withheld":
-            reason = metric["reason"] if metric else data["comparison"].get("reason", "No completed local dates are available.")
+        if metric["status"] == "withheld":
+            reason = evidence["withholding_reason"]
             st.markdown(f'<div class="surface withheld"><div class="metric-label">{METRIC_LABELS[key]}</div><div class="metric-value">Withheld</div><div class="metric-note">{reason}</div></div>', unsafe_allow_html=True)
-            return
-        suffix = " pp" if key == "long_bout_share" else ""
-        recent, baseline, change = metric["recent"], metric["baseline"], metric["absolute_change"]
-        relative = "Relative change unavailable" if metric["relative_change"] is None else f"{metric['relative_change']:+.1f}{' pp' if key == 'long_bout_share' else '%'}"
-        st.markdown(f'<div class="surface"><div class="metric-label">{METRIC_LABELS[key]}</div><div class="metric-value">{recent:,.1f}{suffix}</div><div class="metric-note">Baseline {baseline:,.1f}{suffix} · Change {change:+,.1f}{suffix} · {relative}</div></div>', unsafe_allow_html=True)
+        else:
+            suffix = " pp" if key == "long_bout_share" else ""
+            recent, baseline, change = metric["recent_value"], metric["baseline_value"], metric["absolute_change"]
+            relative = "Relative change unavailable" if metric["relative_change"] is None else f"{metric['relative_change']:+.1f}{' pp' if key == 'long_bout_share' else '%'}"
+            st.markdown(f'<div class="surface"><div class="metric-label">{METRIC_LABELS[key]}</div><div class="metric-value">{recent:,.1f}{suffix}</div><div class="metric-note">Baseline {baseline:,.1f}{suffix} | Change {change:+,.1f}{suffix} | {relative}</div></div>', unsafe_allow_html=True)
+        with st.expander("Evidence"):
+            st.write(explanation)
+            st.caption(f"Definition: {evidence['definition']}")
+            st.caption(f"Formula: {evidence['formula']}")
+            st.caption(f"Baseline {evidence['baseline_window']['start']} to {evidence['baseline_window']['end']}: {evidence['qualifying_days']['baseline']} qualifying days. Recent {evidence['recent_window']['start']} to {evidence['recent_window']['end']}: {evidence['qualifying_days']['recent']} qualifying days.")
+            st.caption(f"Source: {evidence['source_device']['source'] or 'Not supplied'}; device: {evidence['source_device']['device'] or 'Not supplied'}.")
+            st.caption(evidence["assumptions_and_limitations"][0])
+            st.code(f"Evidence ID: {evidence['evidence_id']}\nMetric version: {evidence['calculation_version']}", language=None)
 
 
 def _window_dates(comparison: dict) -> tuple[set, set, pd.Timestamp | None]:
@@ -128,7 +144,7 @@ def _fingerprint_tab(analysis: dict) -> None:
     _, _, boundary = _window_dates(comparison)
     if boundary is not None: fig.add_vline(x=boundary, line_dash="dash", line_color=TEXT, annotation_text="Recent window")
     fig.update_layout(**_plot_layout("Daily observed steps"), legend_title_text="Day status")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     _bout_chart(analysis)
 
 
@@ -155,7 +171,7 @@ def _bout_chart(analysis: dict) -> None:
                  category_orders={"Bout duration": ["<5 minutes", "5-<10 minutes", "10-<15 minutes", "15+ minutes"]},
                  color_discrete_sequence=["#718096", "#5B8FB9", "#52DECF", "#F2BC68"])
     fig.update_layout(**_plot_layout("Bout-step share in qualifying windows"), yaxis_ticksuffix="%")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def _quality_tab(analysis: dict) -> None:
@@ -167,10 +183,10 @@ def _quality_tab(analysis: dict) -> None:
     fig = px.bar(quality, x="local_date", y="coverage", color="qualifies", color_discrete_map={True: TEAL, False: AMBER}, labels={"local_date": "Local date", "coverage": "Usable coverage"})
     fig.add_hline(y=.95, line_dash="dash", line_color=AMBER, annotation_text="95% prototype threshold")
     fig.update_layout(**_plot_layout("Daily usable-minute coverage"), yaxis_tickformat=".0%", showlegend=False)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     table = quality[["local_date", "expected_minutes", "usable_minutes", "coverage", "completed", "qualifies"]].copy()
     table["coverage"] = table.coverage.map("{:.1%}".format)
-    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.dataframe(table, width="stretch", hide_index=True)
     st.markdown('<div class="surface"><b>How to read coverage</b><br><span class="metric-note">A recorded zero is an observed minute with no steps. A missing observation is not treated as zero. Documented non-wear is excluded from usable minutes. Unknown wear remains an explicit limitation: record completeness does not establish wear completeness.</span></div>', unsafe_allow_html=True)
 
 
@@ -179,8 +195,14 @@ def _evidence_tab(analysis: dict, label: str) -> None:
     st.caption("The report retains the engine’s fixed-window policy and explicit withheld states.")
     rhythm = rhythm_status()
     st.markdown(f'<div class="surface withheld"><div class="metric-label">RHYTHM</div><div class="metric-value">IS / IV / M10 withheld</div><div class="metric-note">{rhythm["reason"]}</div></div>', unsafe_allow_html=True)
-    report = analysis["daily"].merge(analysis["quality"], on="local_date").to_csv(index=False).encode("utf-8")
-    st.download_button("Download daily evidence CSV", report, file_name="signal-lab-daily-evidence.csv", mime="text/csv")
+    report = analysis["report"]
+    st.download_button("Download structured evidence JSON", report_json(report), file_name="signal-lab-evidence.json", mime="application/json")
+    daily_csv = analysis["daily"].merge(analysis["quality"], on="local_date").to_csv(index=False).encode("utf-8")
+    st.download_button("Download daily metrics CSV", daily_csv, file_name="signal-lab-daily-metrics.csv", mime="text/csv")
+    st.download_button("Download detected bouts CSV", analysis["bouts"].to_csv(index=False).encode("utf-8"), file_name="signal-lab-bouts.csv", mime="text/csv")
+    st.download_button("Download offline HTML report", html_report(report), file_name="signal-lab-report.html", mime="text/html")
+    st.download_button("Download example input CSV", complete_comparison_example().to_csv(index=False).encode("utf-8"), file_name="signal-lab-example.csv", mime="text/csv")
+    st.markdown('<div class="surface"><b>Input schema</b><br><span class="metric-note">Required columns: <code>timestamp</code>, <code>steps</code>. Optional columns: <code>source</code>, <code>device</code>, <code>worn</code>. Each row is a minute step count; blank steps are missing, while recorded zero remains an observation.</span></div>', unsafe_allow_html=True)
     if label.startswith("Synthetic"):
         st.warning("Synthetic demo data only — not participant data and not PMData P01.")
 
@@ -217,7 +239,7 @@ def main() -> None:
         return
     assert data is not None
     try:
-        analysis = _analyse(data, timezone)
+        analysis = _analyse(data, timezone, is_synthetic=label.startswith("Synthetic"))
     except InputValidationError as exc:
         st.error(f"We could not validate this data: {exc}")
         return
