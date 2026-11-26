@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.streamlit/
+.env
+signal-lab-evidence*.json
+signal-lab-daily-*.csv
+signal-lab-bouts*.csv
+signal-lab-report*.html
