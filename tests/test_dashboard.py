@@ -1,9 +1,10 @@
 from streamlit.testing.v1 import AppTest
 from app import _input_data
+from pathlib import Path
 
 
 def _app():
-    return AppTest.from_file("app.py").run(timeout=30)
+    return AppTest.from_file(Path(__file__).parents[1] / "app.py").run(timeout=30)
 
 
 def test_initial_screen_requires_consent():
